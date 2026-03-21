@@ -1,36 +1,51 @@
-# Contributing to VectraDB
+<h1 align="center">🤝 Contributing to VectraDB</h1>
 
-Thank you for your interest in contributing! This guide will help you get started.
+<p align="center">
+  Thank you for your interest in contributing!<br/>
+  This guide will help you get started.
+</p>
 
-## Development Setup
+---
+
+## 🛠️ Development Setup
 
 ### Prerequisites
 
-- **Rust** 1.70+ ([install](https://rustup.rs/))
-- **protoc** (Protocol Buffers compiler) — needed for gRPC
-- **Git**
+| Tool | Version | Install |
+|------|---------|---------|
+| Rust | 1.70+ | [rustup.rs](https://rustup.rs/) |
+| protoc | any | `brew install protobuf` / `apt install protobuf-compiler` |
+| Git | any | [git-scm.com](https://git-scm.com/) |
+
+### First Time Setup
 
 ```bash
-# Clone the repository
+# Clone
 git clone https://github.com/Amrithesh-Kakkoth/VectraDB.git
 cd VectraDB
 
-# Build everything
+# Build
 cargo build
 
-# Run all tests
-cargo test -p vectradb-components -p vectradb-search -p vectradb-storage -p vectradb-chunkers -p vectradb-api
+# Test
+cargo test -p vectradb-components -p vectradb-search -p vectradb-storage \
+           -p vectradb-chunkers -p vectradb-api
 
-# Check formatting
-cargo fmt --all -- --check
-
-# Run linter (must pass with zero warnings)
+# Lint (must pass with zero warnings)
 cargo clippy --workspace -- -D warnings
+
+# Format
+cargo fmt --all
 ```
 
-## Making Changes
+> [!NOTE]
+> The `vectradb-py` crate requires a Python development installation to build. It's safe to skip it during development — all other crates build independently.
 
-### 1. Create a branch
+---
+
+## 🔄 Workflow
+
+### 1. Create a Branch
 
 ```bash
 git checkout -b feature/your-feature-name
@@ -38,84 +53,103 @@ git checkout -b feature/your-feature-name
 git checkout -b fix/your-bug-fix
 ```
 
-### 2. Make your changes
+### 2. Make Changes
 
 - Write code
 - Add tests for new functionality
 - Run `cargo fmt --all` before committing
-- Run `cargo clippy --workspace -- -D warnings` and fix any warnings
+- Run `cargo clippy --workspace -- -D warnings`
 
-### 3. Test your changes
+### 3. Test
 
 ```bash
-# Run all tests
-cargo test -p vectradb-components -p vectradb-search -p vectradb-storage -p vectradb-chunkers -p vectradb-api
+# All tests
+cargo test -p vectradb-components -p vectradb-search -p vectradb-storage \
+           -p vectradb-chunkers -p vectradb-api
 
-# Run a specific crate's tests
+# Specific crate
 cargo test -p vectradb-search
 
-# Run a specific test
+# Specific test
 cargo test -p vectradb-search -- es4d::tests::test_es4d_insert_and_search
 ```
 
 ### 4. Submit a Pull Request
 
-- Push your branch: `git push -u origin feature/your-feature-name`
-- Open a Pull Request on GitHub
-- Describe what you changed and why
-- Link any related issues
-
-## Code Style
-
-- **Formatting**: Run `cargo fmt --all` before every commit. CI enforces this.
-- **Linting**: `cargo clippy --workspace -- -D warnings` must pass with zero warnings.
-- **Naming**: Use `snake_case` for functions/variables, `PascalCase` for types, `SCREAMING_SNAKE_CASE` for constants.
-- **Error handling**: Return `Result` instead of panicking. Use `thiserror` for error types, `anyhow` for ad-hoc errors.
-- **Unsafe code**: Avoid it. If absolutely necessary, document why it's safe.
-
-## Project Structure
-
-```
-src/components/   — Core types and traits (start here to understand the codebase)
-src/search/       — Search algorithms (HNSW, LSH, PQ, ES4D)
-src/storage/      — Persistent storage (Sled + search index)
-src/api/          — REST API (Axum)
-src/server/       — Server binary (HTTP + gRPC)
-src/chunkers/     — Text chunking utilities
-src_py/           — PyO3 Python bindings
-proto/            — Protocol Buffer definitions
-python-client/    — Python gRPC client
+```bash
+git push -u origin feature/your-feature-name
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed explanation of how components interact.
+Then open a PR on GitHub with:
+- What you changed and why
+- Any related issues
 
-## What to Work On
+---
 
-- Check [GitHub Issues](https://github.com/Amrithesh-Kakkoth/VectraDB/issues) for open tasks
-- Issues labeled `good first issue` are great starting points
-- The [Roadmap](#roadmap) section in the README lists planned features
+## 📏 Code Style
 
-### Ideas for Contributions
+| Rule | Details |
+|------|---------|
+| **Formatting** | `cargo fmt --all` — enforced by CI |
+| **Linting** | `cargo clippy -- -D warnings` — zero warnings |
+| **Naming** | `snake_case` functions, `PascalCase` types, `SCREAMING_SNAKE` constants |
+| **Errors** | Return `Result`, use `thiserror` for types, `anyhow` for ad-hoc |
+| **Unsafe** | Avoid. If necessary, document why it's safe. |
+| **Tests** | Required for new functionality |
 
-- **New distance metrics**: Hamming, Jaccard, etc.
-- **Filtering**: Metadata-based filtering during search
-- **Batch operations**: Bulk insert/delete endpoints
-- **Streaming API**: gRPC streaming for large batch operations
-- **JavaScript/TypeScript client**: Similar to the Python client
-- **Monitoring**: Prometheus metrics endpoint
-- **Benchmarks**: More comprehensive benchmarks with standard datasets (SIFT, GloVe, etc.)
+---
 
-## Adding a New Search Algorithm
+## 📁 Where Things Live
 
-1. Create a new file in `src/search/src/` (e.g., `my_algo.rs`)
+```
+src/components/   ← Start here to understand the codebase
+src/search/       ← Search algorithms (HNSW, LSH, PQ, ES4D)
+src/storage/      ← Persistent storage (Sled + search index)
+src/api/          ← REST API (Axum)
+src/server/       ← Server binary (HTTP + gRPC)
+src/chunkers/     ← Text chunking utilities
+src_py/           ← PyO3 Python bindings
+proto/            ← Protocol Buffer definitions
+python-client/    ← Python gRPC client
+```
+
+> [!TIP]
+> Read [ARCHITECTURE.md](ARCHITECTURE.md) for a visual overview of how components interact.
+
+---
+
+## ➕ Adding a New Search Algorithm
+
+1. Create `src/search/src/my_algo.rs`
 2. Implement the `AdvancedSearch` trait
-3. Add `pub mod my_algo;` and `pub use my_algo::MyAlgoIndex;` in `src/search/src/lib.rs`
-4. Add a variant to the `SearchAlgorithm` enum in `lib.rs`
+3. Add `pub mod my_algo;` and re-export in `src/search/src/lib.rs`
+4. Add a variant to `SearchAlgorithm` enum
 5. Add a match arm in `src/storage/src/lib.rs` → `PersistentVectorDB::new()`
 6. Add CLI parsing in `src/server/src/main.rs`
 7. Add tests
-8. Update documentation
+8. Update docs
 
-## License
+---
 
-By contributing, you agree that your contributions will be licensed under the MIT License.
+## 💡 Ideas for Contributions
+
+- 🧮 **New distance metrics** — Hamming, Jaccard, etc.
+- 🔎 **Metadata filtering** — Filter search results by tags
+- 📦 **Batch operations** — Bulk insert/delete endpoints
+- 🌊 **gRPC streaming** — Stream large batch operations
+- 📊 **Prometheus metrics** — `/metrics` endpoint
+- 🟨 **JavaScript client** — Similar to the Python client
+- 📈 **Standard benchmarks** — SIFT, GloVe dataset comparisons
+
+---
+
+## 📄 License
+
+By contributing, you agree that your contributions will be licensed under the **MIT License**.
+
+---
+
+<p align="center">
+  <a href="README.md">← Back to README</a> •
+  <a href="ARCHITECTURE.md">Architecture →</a>
+</p>
