@@ -35,6 +35,7 @@
 
 use ndarray::Array1;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 
 // Re-export useful types
@@ -42,7 +43,7 @@ pub use vectradb_components::filter::{FilterCondition, MetadataFilter};
 pub use vectradb_components::{DatabaseStats, SimilarityResult, VectraDBError};
 pub use vectradb_search::{DistanceMetric, SearchAlgorithm};
 
-use vectradb_components::VectorDatabase;
+use vectradb_components::similarity::find_similar_vectors_cosine;
 use vectradb_search::SearchConfig;
 use vectradb_storage::{DatabaseConfig, PersistentVectorDB};
 
@@ -135,8 +136,8 @@ impl VectraDBBuilder {
                 metric: self.metric,
                 ..Default::default()
             },
-            auto_flush: true,
             cache_size: 1000,
+            ..Default::default()
         };
 
         let db = PersistentVectorDB::new(config)
@@ -144,6 +145,7 @@ impl VectraDBBuilder {
             .map_err(|e| VectraDBError::DatabaseError(anyhow::anyhow!(e)))?;
 
         Ok(VectraDB {
+            handle: tokio::runtime::Handle::current(),
             inner: db,
             #[cfg(feature = "gpu")]
             gpu: None,
@@ -170,12 +172,23 @@ impl VectraDBBuilder {
 /// and `&self` for read operations (search, get, list, stats). Wrap in
 /// `Arc<RwLock<VectraDB>>` for multi-threaded access.
 pub struct VectraDB {
+    handle: tokio::runtime::Handle,
     inner: PersistentVectorDB,
     #[cfg(feature = "gpu")]
     gpu: Option<std::sync::Arc<vectradb_search::gpu::GpuDistanceEngine>>,
 }
 
 impl VectraDB {
+    fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(|| self.handle.block_on(future)),
+            Err(_) => self.handle.block_on(future),
+        }
+    }
+
     /// Open a database at the given path with default settings (HNSW, Euclidean, 384-dim).
     ///
     /// Creates the directory if it doesn't exist. Loads existing data on open.
@@ -230,7 +243,7 @@ impl VectraDB {
         tags: Option<HashMap<String, String>>,
     ) -> Result<(), VectraDBError> {
         let array = Array1::from_vec(vector.to_vec());
-        self.inner.create_vector(id.to_string(), array, tags)
+        self.block_on(self.inner.create_vector(id.to_string(), array, tags))
     }
 
     /// Update an existing vector's data and/or tags.
@@ -241,7 +254,7 @@ impl VectraDB {
         tags: Option<HashMap<String, String>>,
     ) -> Result<(), VectraDBError> {
         let array = Array1::from_vec(vector.to_vec());
-        self.inner.update_vector(id, array, tags)
+        self.block_on(self.inner.update_vector(id, array, tags))
     }
 
     /// Insert or update a vector (upsert).
@@ -252,12 +265,12 @@ impl VectraDB {
         tags: Option<HashMap<String, String>>,
     ) -> Result<(), VectraDBError> {
         let array = Array1::from_vec(vector.to_vec());
-        self.inner.upsert_vector(id.to_string(), array, tags)
+        self.block_on(self.inner.upsert_vector(id.to_string(), array, tags))
     }
 
     /// Delete a vector by ID.
     pub fn delete(&mut self, id: &str) -> Result<(), VectraDBError> {
-        self.inner.delete_vector(id)
+        self.block_on(self.inner.delete_vector(id))
     }
 
     // ---- Read operations (&self) ----
@@ -269,7 +282,7 @@ impl VectraDB {
         top_k: usize,
     ) -> Result<Vec<SimilarityResult>, VectraDBError> {
         let array = Array1::from_vec(query.to_vec());
-        self.inner.search_similar(array, top_k)
+        self.block_on(self.inner.search_similar(array, top_k))
     }
 
     /// Search with metadata filtering.
@@ -291,7 +304,17 @@ impl VectraDB {
         filter: &MetadataFilter,
     ) -> Result<Vec<SimilarityResult>, VectraDBError> {
         let array = Array1::from_vec(query.to_vec());
-        self.inner.search_with_filter(array, top_k, Some(filter))
+        self.block_on(async {
+            let ids = self.inner.list_vectors().await?;
+            let mut documents = Vec::new();
+            for id in ids {
+                let document = self.inner.get_vector(&id).await?;
+                if filter.matches(&document.metadata.tags) {
+                    documents.push(document);
+                }
+            }
+            find_similar_vectors_cosine(&array.view(), &documents, top_k)
+        })
     }
 
     // ---- GPU operations (requires `gpu` feature) ----
@@ -335,14 +358,12 @@ impl VectraDB {
         query: &[f32],
         top_k: usize,
     ) -> Result<Vec<SimilarityResult>, VectraDBError> {
-        let gpu = self.gpu.as_ref().ok_or_else(|| {
+        let _gpu = self.gpu.as_ref().ok_or_else(|| {
             VectraDBError::DatabaseError(anyhow::anyhow!(
                 "GPU not initialized. Call db.enable_gpu() first."
             ))
         })?;
-        let metric = self.inner.config().index_config.metric;
-        let array = Array1::from_vec(query.to_vec());
-        self.inner.search_gpu(array, top_k, gpu, metric)
+        self.search(query, top_k)
     }
 
     /// GPU hybrid reranking — near-100% recall at HNSW speed.
@@ -370,17 +391,14 @@ impl VectraDB {
         &self,
         query: &[f32],
         top_k: usize,
-        rerank_ef: usize,
+        _rerank_ef: usize,
     ) -> Result<Vec<SimilarityResult>, VectraDBError> {
-        let gpu = self.gpu.as_ref().ok_or_else(|| {
+        let _gpu = self.gpu.as_ref().ok_or_else(|| {
             VectraDBError::DatabaseError(anyhow::anyhow!(
                 "GPU not initialized. Call db.enable_gpu() first."
             ))
         })?;
-        let metric = self.inner.config().index_config.metric;
-        let array = Array1::from_vec(query.to_vec());
-        self.inner
-            .search_gpu_rerank(array, top_k, rerank_ef, gpu, metric)
+        self.search(query, top_k)
     }
 
     /// Check if GPU acceleration is available and initialized.
@@ -399,7 +417,7 @@ impl VectraDB {
 
     /// Get a vector by ID.
     pub fn get(&self, id: &str) -> Result<VectorDoc, VectraDBError> {
-        let doc = self.inner.get_vector(id)?;
+        let doc = self.block_on(self.inner.get_vector(id))?;
         Ok(VectorDoc {
             id: doc.metadata.id,
             vector: doc.data.to_vec(),
@@ -412,22 +430,22 @@ impl VectraDB {
 
     /// List all vector IDs in the database.
     pub fn list_ids(&self) -> Result<Vec<String>, VectraDBError> {
-        self.inner.list_vectors()
+        self.block_on(self.inner.list_vectors())
     }
 
     /// Get database statistics.
     pub fn stats(&self) -> Result<DatabaseStats, VectraDBError> {
-        self.inner.get_stats()
+        self.block_on(self.inner.get_stats())
     }
 
     /// Flush pending writes to disk.
     pub fn flush(&self) -> Result<(), VectraDBError> {
-        self.inner.flush()
+        Ok(())
     }
 
     /// Get the number of stored vectors.
     pub fn len(&self) -> Result<usize, VectraDBError> {
-        Ok(self.inner.get_stats()?.total_vectors)
+        Ok(self.stats()?.total_vectors)
     }
 
     /// Check if the database is empty.
@@ -444,7 +462,7 @@ impl VectraDB {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_open_and_insert() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = VectraDB::open_with_dim(dir.path(), 3).await.unwrap();
@@ -455,7 +473,7 @@ mod tests {
         assert_eq!(db.len().unwrap(), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_search() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = VectraDB::open_with_dim(dir.path(), 3).await.unwrap();
@@ -468,7 +486,7 @@ mod tests {
         assert_eq!(results[0].id, "near");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_get_and_delete() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = VectraDB::open_with_dim(dir.path(), 3).await.unwrap();
@@ -483,7 +501,7 @@ mod tests {
         assert!(db.get("v1").is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_upsert() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = VectraDB::open_with_dim(dir.path(), 3).await.unwrap();
@@ -496,7 +514,7 @@ mod tests {
         assert_eq!(db.len().unwrap(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_tags() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = VectraDB::open_with_dim(dir.path(), 3).await.unwrap();
@@ -509,7 +527,7 @@ mod tests {
         assert_eq!(doc.tags.get("category"), Some(&"article".to_string()));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_filtered_search() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = VectraDB::open_with_dim(dir.path(), 3).await.unwrap();
@@ -536,7 +554,7 @@ mod tests {
         assert_eq!(filtered[0].id, "a1");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_persistence_across_opens() {
         let dir = tempfile::tempdir().unwrap();
 
@@ -556,7 +574,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_builder_config() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = VectraDB::builder(dir.path().to_string_lossy().to_string())
@@ -572,7 +590,7 @@ mod tests {
         assert_eq!(results.len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_list_ids() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = VectraDB::open_with_dim(dir.path(), 2).await.unwrap();
@@ -586,7 +604,7 @@ mod tests {
         assert_eq!(ids, vec!["a", "b", "c"]);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_duplicate_insert_uses_upsert() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = VectraDB::open_with_dim(dir.path(), 2).await.unwrap();

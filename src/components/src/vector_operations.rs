@@ -9,6 +9,8 @@ pub fn create_vector_document(
     vector: Array1<f32>,
     tags: Option<HashMap<String, String>>,
 ) -> Result<VectorDocument, VectraDBError> {
+    validate_vector(&vector)?;
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -41,6 +43,8 @@ pub fn update_vector_document(
             actual: vector.len(),
         });
     }
+
+    validate_vector(&vector)?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

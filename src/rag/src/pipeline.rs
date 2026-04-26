@@ -3,7 +3,7 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
-use vectradb_components::{SimilarityResult, VectorDatabase};
+use vectradb_components::SimilarityResult;
 use vectradb_storage::PersistentVectorDB;
 
 use crate::llm::{ChatMessage, ChatRole, CompletionConfig, LlmProvider};
@@ -95,6 +95,7 @@ impl RagPipeline {
         let db = self.db.read().await;
         let results = db
             .search_similar(query_array, self.config.top_k)
+            .await
             .map_err(|e| RagError::SearchError(format!("{e}")))?;
         drop(db);
         let search_time_ms = search_start.elapsed().as_secs_f64() * 1000.0;

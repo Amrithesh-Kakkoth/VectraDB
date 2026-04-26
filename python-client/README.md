@@ -8,6 +8,8 @@ Python client library for VectraDB vector database. This client uses gRPC to com
 pip install vectradb-client
 ```
 
+The package ships checked-in protobuf stubs, so importing the client does not require local proto generation.
+
 Or install from source:
 
 ```bash
@@ -24,21 +26,20 @@ from vectradb_client import VectraDBClient
 client = VectraDBClient(host="localhost", port=50051)
 
 # Create a vector
-vector_id = client.create_vector(
+vector = client.create_vector(
     id="vec1",
-    values=[0.1, 0.2, 0.3],
-    metadata={"type": "example", "count": 42}
+    vector=[0.1, 0.2, 0.3],
+    tags={"type": "example", "count": "42"}
 )
 
 # Search for similar vectors
-results = client.search(
-    query=[0.1, 0.2, 0.3],
-    k=10,
-    ef_search=100
+response = client.search_similar(
+    vector=[0.1, 0.2, 0.3],
+    top_k=10,
 )
 
-for result in results:
-    print(f"ID: {result.id}, Distance: {result.distance}")
+for result in response.results:
+    print(f"ID: {result.id}, Score: {result.score}")
 
 # Get database statistics
 stats = client.get_stats()
@@ -58,14 +59,14 @@ async def main():
         # Create a vector
         await client.create_vector(
             id="vec1",
-            values=[0.1, 0.2, 0.3],
-            metadata={"type": "example"}
+            vector=[0.1, 0.2, 0.3],
+            tags={"type": "example"}
         )
         
         # Search
-        results = await client.search(query=[0.1, 0.2, 0.3], k=10)
-        for result in results:
-            print(f"ID: {result.id}, Distance: {result.distance}")
+        response = await client.search_similar(vector=[0.1, 0.2, 0.3], top_k=10)
+        for result in response.results:
+            print(f"ID: {result.id}, Score: {result.score}")
 ```
 
 ## API Reference
@@ -74,31 +75,34 @@ async def main():
 
 #### Methods
 
-- `create_vector(id: str, values: List[float], metadata: Optional[Dict[str, Any]] = None) -> str`
-  - Create a new vector with the given ID and values
+- `create_vector(id: str, vector: List[float], tags: Optional[Dict[str, str]] = None) -> Vector`
+  - Create a new vector and return the stored document
   
 - `get_vector(id: str) -> Vector`
   - Retrieve a vector by ID
   
-- `update_vector(id: str, values: Optional[List[float]] = None, metadata: Optional[Dict[str, Any]] = None) -> bool`
-  - Update an existing vector's values and/or metadata
+- `update_vector(id: str, vector: List[float], tags: Optional[Dict[str, str]] = None) -> Vector`
+  - Update an existing vector and return the stored document
   
-- `delete_vector(id: str) -> bool`
+- `delete_vector(id: str) -> DeleteResult`
   - Delete a vector by ID
   
-- `upsert_vector(id: str, values: List[float], metadata: Optional[Dict[str, Any]] = None) -> str`
+- `upsert_vector(id: str, vector: List[float], tags: Optional[Dict[str, str]] = None) -> Vector`
   - Create or update a vector (upsert operation)
   
-- `search(query: List[float], k: int = 10, ef_search: Optional[int] = None) -> List[SearchResult]`
-  - Search for k nearest neighbors of the query vector
+- `search_similar(vector: List[float], top_k: int = 10) -> SearchResponse`
+  - Search for the nearest neighbors of the query vector
+
+- `search(query: List[float], k: int = 10) -> List[SearchResult]`
+  - Compatibility alias that returns only `SearchResponse.results`
   
-- `list_vectors(limit: Optional[int] = None, offset: Optional[int] = None) -> List[Vector]`
-  - List all vectors in the database with pagination
+- `list_vectors() -> List[str]`
+  - List all stored vector IDs
   
 - `get_stats() -> DatabaseStats`
   - Get database statistics (total vectors, memory usage, etc.)
   
-- `health_check() -> bool`
+- `health_check() -> HealthStatus`
   - Check if the server is healthy and responding
 
 ## Requirements

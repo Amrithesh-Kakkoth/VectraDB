@@ -30,7 +30,6 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::time::Instant;
 
 use crate::AppState;
-use vectradb_components::VectorDatabase;
 
 /// Install the Prometheus metrics recorder.
 /// Must be called once at startup before any metrics are recorded.
@@ -44,12 +43,10 @@ pub fn install_prometheus_recorder() -> PrometheusHandle {
 /// GET /metrics — render all metrics in Prometheus text format.
 pub async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     // Update database gauges on each scrape
-    if let Ok(db) = state.db.try_read() {
-        if let Ok(stats) = db.get_stats() {
-            gauge!("vectradb_vectors_total").set(stats.total_vectors as f64);
-            gauge!("vectradb_dimension").set(stats.dimension as f64);
-            gauge!("vectradb_memory_usage_bytes").set(stats.memory_usage as f64);
-        }
+    if let Ok(stats) = state.db.get_stats().await {
+        gauge!("vectradb_vectors_total").set(stats.total_vectors as f64);
+        gauge!("vectradb_dimension").set(stats.dimension as f64);
+        gauge!("vectradb_memory_usage_bytes").set(stats.memory_usage as f64);
     }
 
     let handle = state

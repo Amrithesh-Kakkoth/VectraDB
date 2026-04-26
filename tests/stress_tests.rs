@@ -542,14 +542,16 @@ async fn test_persistent_storage_survives_restart() {
 
     // Write vectors
     {
-        let mut db = vectradb_storage::PersistentVectorDB::new(config.clone())
+        let db = vectradb_storage::PersistentVectorDB::new(config.clone())
             .await
             .unwrap();
         for i in 0..50 {
             let v = random_vector(dim);
-            db.create_vector(format!("persist_{i}"), v, None).unwrap();
+            db.create_vector(format!("persist_{i}"), v, None)
+                .await
+                .unwrap();
         }
-        assert_eq!(db.list_vectors().unwrap().len(), 50);
+        assert_eq!(db.list_vectors().await.unwrap().len(), 50);
     }
     // db is dropped here — simulates server shutdown
 
@@ -558,7 +560,7 @@ async fn test_persistent_storage_survives_restart() {
         let db = vectradb_storage::PersistentVectorDB::new(config)
             .await
             .unwrap();
-        let ids = db.list_vectors().unwrap();
+        let ids = db.list_vectors().await.unwrap();
         assert_eq!(
             ids.len(),
             50,
@@ -567,12 +569,12 @@ async fn test_persistent_storage_survives_restart() {
         );
 
         // Verify a specific vector is retrievable
-        let doc = db.get_vector("persist_0").unwrap();
+        let doc = db.get_vector("persist_0").await.unwrap();
         assert_eq!(doc.metadata.dimension, dim);
 
         // Search should work on reopened data
         let query = random_vector(dim);
-        let results = db.search_similar(query, 5).unwrap();
+        let results = db.search_similar(query, 5).await.unwrap();
         assert_eq!(results.len(), 5);
     }
 }
@@ -1105,7 +1107,7 @@ async fn test_persistent_db_search_with_filter() {
         ..Default::default()
     };
 
-    let mut db = vectradb_storage::PersistentVectorDB::new(config)
+    let db = vectradb_storage::PersistentVectorDB::new(config)
         .await
         .unwrap();
 
@@ -1122,13 +1124,18 @@ async fn test_persistent_db_search_with_filter() {
         let mut tags = HashMap::new();
         tags.insert("category".to_string(), category.to_string());
         tags.insert("index".to_string(), i.to_string());
-        db.create_vector(format!("f{i}"), v, Some(tags)).unwrap();
+        db.create_vector(format!("f{i}"), v, Some(tags))
+            .await
+            .unwrap();
     }
 
     let query = random_vector(dim);
 
     // Search without filter — should return results from any category
-    let all_results = db.search_with_filter(query.clone(), 10, None).unwrap();
+    let all_results = db
+        .search_with_filter(query.clone(), 10, None)
+        .await
+        .unwrap();
     assert_eq!(all_results.len(), 10);
 
     // Search with filter: category="article"
@@ -1138,6 +1145,7 @@ async fn test_persistent_db_search_with_filter() {
     });
     let article_results = db
         .search_with_filter(query.clone(), 10, Some(&article_filter))
+        .await
         .unwrap();
 
     // All results should have category=article
@@ -1161,6 +1169,7 @@ async fn test_persistent_db_search_with_filter() {
     });
     let not_image_results = db
         .search_with_filter(query.clone(), 20, Some(&not_image_filter))
+        .await
         .unwrap();
 
     for r in &not_image_results {
@@ -1179,6 +1188,7 @@ async fn test_persistent_db_search_with_filter() {
     });
     let empty_results = db
         .search_with_filter(query, 10, Some(&impossible_filter))
+        .await
         .unwrap();
     assert!(
         empty_results.is_empty(),

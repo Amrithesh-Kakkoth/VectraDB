@@ -10,6 +10,8 @@ pub use ndarray::{Array1, ArrayView1};
 pub enum VectraDBError {
     #[error("Vector dimension mismatch: expected {expected}, got {actual}")]
     DimensionMismatch { expected: usize, actual: usize },
+    #[error("Vector already exists: {id}")]
+    VectorAlreadyExists { id: String },
     #[error("Vector not found: {id}")]
     VectorNotFound { id: String },
     #[error("Vector already exists: {id}")]
@@ -43,6 +45,54 @@ pub struct SimilarityResult {
     pub id: String,
     pub score: f32,
     pub metadata: VectorMetadata,
+}
+
+/// Shared vector input shape for batch APIs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorInput {
+    pub id: String,
+    pub vector: Vec<f32>,
+    pub tags: HashMap<String, String>,
+}
+
+/// Per-item batch write status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchWriteItemStatus {
+    pub id: String,
+    pub code: String,
+    pub message: String,
+}
+
+impl BatchWriteItemStatus {
+    pub fn ok(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            code: "OK".to_string(),
+            message: String::new(),
+        }
+    }
+
+    pub fn error(
+        id: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn is_ok(&self) -> bool {
+        self.code == "OK"
+    }
+}
+
+/// Order-preserving batch write response
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BatchWriteResponse {
+    pub statuses: Vec<BatchWriteItemStatus>,
 }
 
 /// Vector database trait for different implementations

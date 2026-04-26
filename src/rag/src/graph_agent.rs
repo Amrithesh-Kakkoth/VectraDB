@@ -4,7 +4,6 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
-use vectradb_components::VectorDatabase;
 use vectradb_storage::PersistentVectorDB;
 
 use crate::llm::{CompletionConfig, LlmProvider};
@@ -109,6 +108,7 @@ impl GraphAgent {
         let db = self.db.read().await;
         let seed_results = db
             .search_similar(query_array, self.config.seed_top_k)
+            .await
             .map_err(|e| RagError::SearchError(format!("{e}")))?;
         drop(db);
 
@@ -182,6 +182,7 @@ impl GraphAgent {
                     let db = self.db.read().await;
                     let results = db
                         .search_similar(concept_array, self.config.branch_factor)
+                        .await
                         .map_err(|e| RagError::SearchError(format!("{e}")))?;
                     drop(db);
 

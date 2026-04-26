@@ -71,7 +71,7 @@ impl VectorDatabase for InMemoryVectorDB {
 
         let mut vectors = self.vectors.write().unwrap_or_else(|e| e.into_inner());
         if vectors.contains_key(&id) {
-            return Err(VectraDBError::DuplicateVector { id });
+            return Err(VectraDBError::VectorAlreadyExists { id });
         }
 
         vectors.insert(id, doc);

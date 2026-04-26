@@ -1,34 +1,85 @@
 use ndarray::Array1;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
-use vectradb_components::VectorDatabase;
+use vectradb_components::{
+    BatchWriteResponse as CoreBatchWriteResponse, VectorDocument, VectorInput as CoreVectorInput,
+    VectraDBError,
+};
 use vectradb_storage::PersistentVectorDB;
 
-// Include generated proto code
 pub mod vectradb {
     tonic::include_proto!("vectradb");
 }
 
 use vectradb::{
     vectra_db_server::{VectraDb, VectraDbServer},
+    BatchCreateVectorsRequest, BatchUpsertVectorsRequest, BatchWriteItemStatus, BatchWriteResponse,
     CreateVectorRequest, DeleteVectorRequest, DeleteVectorResponse, GetStatsRequest,
     GetVectorRequest, HealthCheckRequest, HealthCheckResponse, ListVectorsRequest,
     ListVectorsResponse, SearchRequest, SearchResponse, SimilarityResult, StatsResponse,
-    UpdateVectorRequest, UpsertVectorRequest, VectorMetadata, VectorResponse,
+    UpdateVectorRequest, UpsertVectorRequest, VectorInput, VectorMetadata, VectorResponse,
 };
 
 pub struct VectraDbService {
-    db: Arc<RwLock<PersistentVectorDB>>,
+    db: Arc<PersistentVectorDB>,
 }
 
 impl VectraDbService {
-    pub fn new(db: Arc<RwLock<PersistentVectorDB>>) -> Self {
+    pub fn new(db: Arc<PersistentVectorDB>) -> Self {
         Self { db }
     }
 
     pub fn into_service(self) -> VectraDbServer<Self> {
         VectraDbServer::new(self)
+    }
+
+    fn map_error(error: VectraDBError) -> Status {
+        match error {
+            VectraDBError::VectorAlreadyExists { id } | VectraDBError::DuplicateVector { id } => {
+                Status::already_exists(format!("Vector already exists: {id}"))
+            }
+            VectraDBError::VectorNotFound { id } => {
+                Status::not_found(format!("Vector not found: {id}"))
+            }
+            VectraDBError::DimensionMismatch { expected, actual } => Status::invalid_argument(
+                format!("Vector dimension mismatch: expected {expected}, got {actual}"),
+            ),
+            VectraDBError::InvalidVector => Status::invalid_argument("Invalid vector data"),
+            VectraDBError::DatabaseError(inner) => Status::internal(inner.to_string()),
+        }
+    }
+
+    fn document_response(document: VectorDocument) -> VectorResponse {
+        VectorResponse {
+            id: document.metadata.id,
+            vector: document.data.to_vec(),
+            dimension: document.metadata.dimension as u64,
+            created_at: document.metadata.created_at,
+            updated_at: document.metadata.updated_at,
+            tags: document.metadata.tags,
+        }
+    }
+
+    fn batch_response(results: CoreBatchWriteResponse) -> BatchWriteResponse {
+        BatchWriteResponse {
+            statuses: results
+                .statuses
+                .into_iter()
+                .map(|item| BatchWriteItemStatus {
+                    id: item.id,
+                    code: item.code,
+                    message: item.message,
+                })
+                .collect(),
+        }
+    }
+
+    fn into_write_vector(input: VectorInput) -> CoreVectorInput {
+        CoreVectorInput {
+            id: input.id,
+            vector: input.vector,
+            tags: input.tags,
+        }
     }
 }
 
@@ -40,50 +91,52 @@ impl VectraDb for VectraDbService {
     ) -> Result<Response<VectorResponse>, Status> {
         let req = request.into_inner();
         let vector = Array1::from_vec(req.vector);
+        if vector.is_empty() {
+            return Err(Status::invalid_argument("vector must not be empty"));
+        }
         let tags = if req.tags.is_empty() {
             None
         } else {
             Some(req.tags)
         };
 
-        let mut db = self.db.write().await;
-        db.create_vector(req.id.clone(), vector, tags)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        self.db
+            .create_vector(req.id.clone(), vector, tags)
+            .await
+            .map_err(Self::map_error)?;
 
-        // Fetch created vector
-        let document = db
-            .get_vector(&req.id)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let document = self.db.get_vector(&req.id).await.map_err(Self::map_error)?;
+        Ok(Response::new(Self::document_response(document)))
+    }
 
-        Ok(Response::new(VectorResponse {
-            id: document.metadata.id,
-            vector: document.data.to_vec(),
-            dimension: document.metadata.dimension as u64,
-            created_at: document.metadata.created_at,
-            updated_at: document.metadata.updated_at,
-            tags: document.metadata.tags,
-        }))
+    async fn batch_create_vectors(
+        &self,
+        request: Request<BatchCreateVectorsRequest>,
+    ) -> Result<Response<BatchWriteResponse>, Status> {
+        let items = request
+            .into_inner()
+            .items
+            .into_iter()
+            .map(Self::into_write_vector)
+            .collect();
+        let results = self
+            .db
+            .batch_create_vectors(items)
+            .await
+            .map_err(Self::map_error)?;
+        Ok(Response::new(Self::batch_response(results)))
     }
 
     async fn get_vector(
         &self,
         request: Request<GetVectorRequest>,
     ) -> Result<Response<VectorResponse>, Status> {
-        let req = request.into_inner();
-        let db = self.db.read().await;
-
-        let document = db
-            .get_vector(&req.id)
-            .map_err(|e| Status::not_found(e.to_string()))?;
-
-        Ok(Response::new(VectorResponse {
-            id: document.metadata.id,
-            vector: document.data.to_vec(),
-            dimension: document.metadata.dimension as u64,
-            created_at: document.metadata.created_at,
-            updated_at: document.metadata.updated_at,
-            tags: document.metadata.tags,
-        }))
+        let document = self
+            .db
+            .get_vector(&request.into_inner().id)
+            .await
+            .map_err(Self::map_error)?;
+        Ok(Response::new(Self::document_response(document)))
     }
 
     async fn update_vector(
@@ -92,40 +145,32 @@ impl VectraDb for VectraDbService {
     ) -> Result<Response<VectorResponse>, Status> {
         let req = request.into_inner();
         let vector = Array1::from_vec(req.vector);
+        if vector.is_empty() {
+            return Err(Status::invalid_argument("vector must not be empty"));
+        }
         let tags = if req.tags.is_empty() {
             None
         } else {
             Some(req.tags)
         };
 
-        let mut db = self.db.write().await;
-        db.update_vector(&req.id, vector, tags)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        self.db
+            .update_vector(&req.id, vector, tags)
+            .await
+            .map_err(Self::map_error)?;
 
-        let document = db
-            .get_vector(&req.id)
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(Response::new(VectorResponse {
-            id: document.metadata.id,
-            vector: document.data.to_vec(),
-            dimension: document.metadata.dimension as u64,
-            created_at: document.metadata.created_at,
-            updated_at: document.metadata.updated_at,
-            tags: document.metadata.tags,
-        }))
+        let document = self.db.get_vector(&req.id).await.map_err(Self::map_error)?;
+        Ok(Response::new(Self::document_response(document)))
     }
 
     async fn delete_vector(
         &self,
         request: Request<DeleteVectorRequest>,
     ) -> Result<Response<DeleteVectorResponse>, Status> {
-        let req = request.into_inner();
-        let mut db = self.db.write().await;
-
-        db.delete_vector(&req.id)
-            .map_err(|e| Status::internal(e.to_string()))?;
-
+        self.db
+            .delete_vector(&request.into_inner().id)
+            .await
+            .map_err(Self::map_error)?;
         Ok(Response::new(DeleteVectorResponse { success: true }))
     }
 
@@ -135,28 +180,40 @@ impl VectraDb for VectraDbService {
     ) -> Result<Response<VectorResponse>, Status> {
         let req = request.into_inner();
         let vector = Array1::from_vec(req.vector);
+        if vector.is_empty() {
+            return Err(Status::invalid_argument("vector must not be empty"));
+        }
         let tags = if req.tags.is_empty() {
             None
         } else {
             Some(req.tags)
         };
 
-        let mut db = self.db.write().await;
-        db.upsert_vector(req.id.clone(), vector, tags)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        self.db
+            .upsert_vector(req.id.clone(), vector, tags)
+            .await
+            .map_err(Self::map_error)?;
 
-        let document = db
-            .get_vector(&req.id)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let document = self.db.get_vector(&req.id).await.map_err(Self::map_error)?;
+        Ok(Response::new(Self::document_response(document)))
+    }
 
-        Ok(Response::new(VectorResponse {
-            id: document.metadata.id,
-            vector: document.data.to_vec(),
-            dimension: document.metadata.dimension as u64,
-            created_at: document.metadata.created_at,
-            updated_at: document.metadata.updated_at,
-            tags: document.metadata.tags,
-        }))
+    async fn batch_upsert_vectors(
+        &self,
+        request: Request<BatchUpsertVectorsRequest>,
+    ) -> Result<Response<BatchWriteResponse>, Status> {
+        let items = request
+            .into_inner()
+            .items
+            .into_iter()
+            .map(Self::into_write_vector)
+            .collect();
+        let results = self
+            .db
+            .batch_upsert_vectors(items)
+            .await
+            .map_err(Self::map_error)?;
+        Ok(Response::new(Self::batch_response(results)))
     }
 
     async fn search_similar(
@@ -168,35 +225,33 @@ impl VectraDb for VectraDbService {
         if vector.is_empty() {
             return Err(Status::invalid_argument("query vector must not be empty"));
         }
-        let top_k = (req.top_k as usize).clamp(1, 10000);
+        let top_k = (req.top_k as usize).clamp(1, 10_000);
 
         let start_time = std::time::Instant::now();
-        let db = self.db.read().await;
-
-        let results = db
+        let results = self
+            .db
             .search_similar(vector, top_k)
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let total_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+            .await
+            .map_err(Self::map_error)?;
 
         let grpc_results = results
             .into_iter()
-            .map(|r| SimilarityResult {
-                id: r.id.clone(),
-                score: r.score,
+            .map(|result| SimilarityResult {
+                id: result.id.clone(),
+                score: result.score,
                 metadata: Some(VectorMetadata {
-                    id: r.metadata.id,
-                    dimension: r.metadata.dimension as u64,
-                    created_at: r.metadata.created_at,
-                    updated_at: r.metadata.updated_at,
-                    tags: r.metadata.tags,
+                    id: result.metadata.id,
+                    dimension: result.metadata.dimension as u64,
+                    created_at: result.metadata.created_at,
+                    updated_at: result.metadata.updated_at,
+                    tags: result.metadata.tags,
                 }),
             })
             .collect();
 
         Ok(Response::new(SearchResponse {
             results: grpc_results,
-            total_time_ms,
+            total_time_ms: start_time.elapsed().as_secs_f64() * 1000.0,
         }))
     }
 
@@ -204,11 +259,7 @@ impl VectraDb for VectraDbService {
         &self,
         _request: Request<ListVectorsRequest>,
     ) -> Result<Response<ListVectorsResponse>, Status> {
-        let db = self.db.read().await;
-        let ids = db
-            .list_vectors()
-            .map_err(|e| Status::internal(e.to_string()))?;
-
+        let ids = self.db.list_vectors().await.map_err(Self::map_error)?;
         Ok(Response::new(ListVectorsResponse { ids }))
     }
 
@@ -216,11 +267,7 @@ impl VectraDb for VectraDbService {
         &self,
         _request: Request<GetStatsRequest>,
     ) -> Result<Response<StatsResponse>, Status> {
-        let db = self.db.read().await;
-        let stats = db
-            .get_stats()
-            .map_err(|e| Status::internal(e.to_string()))?;
-
+        let stats = self.db.get_stats().await.map_err(Self::map_error)?;
         Ok(Response::new(StatsResponse {
             total_vectors: stats.total_vectors as u64,
             dimension: stats.dimension as u64,

@@ -27,13 +27,13 @@ setup(
     python_requires=">=3.8",
     install_requires=[
         "grpcio>=1.60.0",
-        "grpcio-tools>=1.60.0",
         "protobuf>=4.25.0",
     ],
     extras_require={
         "dev": [
             "pytest>=7.4.0",
             "pytest-asyncio>=0.21.0",
+            "grpcio-tools>=1.60.0",
             "black>=23.0.0",
             "mypy>=1.5.0",
         ],

@@ -56,6 +56,20 @@ class VectraDB:
             tags=tags or {}
         )
         return self.stub.CreateVector(request)
+
+    def batch_create(self, items: List[Dict[str, object]]):
+        """Create many vectors in one RPC."""
+        request = vectradb_pb2.BatchCreateVectorsRequest(
+            items=[
+                vectradb_pb2.VectorInput(
+                    id=str(item["id"]),
+                    vector=list(item["vector"]),
+                    tags={str(k): str(v) for k, v in dict(item.get("tags", {})).items()},
+                )
+                for item in items
+            ]
+        )
+        return self.stub.BatchCreateVectors(request)
     
     def get(self, id: str):
         """Get a vector by ID."""
@@ -84,6 +98,20 @@ class VectraDB:
             tags=tags or {}
         )
         return self.stub.UpsertVector(request)
+
+    def batch_upsert(self, items: List[Dict[str, object]]):
+        """Upsert many vectors in one RPC."""
+        request = vectradb_pb2.BatchUpsertVectorsRequest(
+            items=[
+                vectradb_pb2.VectorInput(
+                    id=str(item["id"]),
+                    vector=list(item["vector"]),
+                    tags={str(k): str(v) for k, v in dict(item.get("tags", {})).items()},
+                )
+                for item in items
+            ]
+        )
+        return self.stub.BatchUpsertVectors(request)
     
     def search(self, vector: List[float], k: int = 10):
         """Search for similar vectors."""

@@ -1,169 +1,182 @@
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tonic::transport::Server;
 use vectradb_search::{DistanceMetric, SearchAlgorithm};
-use vectradb_storage::{DatabaseConfig, PersistentVectorDB};
+use vectradb_storage::{DatabaseConfig, DurabilityMode, PersistentVectorDB};
 
 mod grpc;
 use grpc::VectraDbService;
 
-/// VectraDB Server - High-performance vector database
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
-struct Args {
-    /// Data directory for persistent storage
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    serve: ServeArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    Migrate(MigrateArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct ServeArgs {
     #[arg(short = 'D', long, default_value = "./vectradb_data")]
     data_dir: PathBuf,
 
-    /// Server port
     #[arg(short, long, default_value = "8080")]
     port: u16,
 
-    /// gRPC server port
     #[arg(long, default_value = "50051")]
     grpc_port: u16,
 
-    /// Enable gRPC server
-    #[arg(long, default_value = "true")]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     enable_grpc: bool,
 
-    /// Search algorithm (hnsw, lsh, pq)
     #[arg(short, long, default_value = "hnsw")]
     algorithm: String,
 
-    /// Vector dimension
     #[arg(short = 'd', long, default_value = "384")]
     dimension: usize,
 
-    /// Maximum connections for HNSW
     #[arg(long, default_value = "16")]
     max_connections: usize,
 
-    /// Search ef parameter
     #[arg(long, default_value = "50")]
     search_ef: usize,
 
-    /// Construction ef parameter
     #[arg(long, default_value = "200")]
     construction_ef: usize,
 
-    /// Number of hash functions for LSH
     #[arg(long, default_value = "10")]
     num_hashes: usize,
 
-    /// Number of buckets for LSH
     #[arg(long, default_value = "1000")]
     num_buckets: usize,
 
-    /// Shard length for ES4D DET (dimension-level early termination)
     #[arg(long, default_value = "64")]
     shard_length: usize,
 
-    /// Distance metric: euclidean, cosine, dot
     #[arg(long, default_value = "euclidean")]
     metric: String,
 
-    /// IVF: number of clusters (partitions). Rule of thumb: sqrt(n) to 4*sqrt(n)
     #[arg(long, default_value = "256")]
     ivf_nlist: usize,
 
-    /// IVF: number of clusters to search per query (higher = better recall, slower)
     #[arg(long, default_value = "16")]
     ivf_nprobe: usize,
 
-    /// Enable auto-flush
-    #[arg(long, default_value = "true")]
-    auto_flush: bool,
+    #[arg(long, default_value = "batch")]
+    durability_mode: String,
 
-    /// Cache size
+    #[arg(long, default_value = "10")]
+    commit_interval_ms: u64,
+
+    #[arg(long, default_value = "2000")]
+    commit_max_vectors: usize,
+
+    #[arg(long, default_value = "4194304")]
+    commit_max_bytes: usize,
+
+    #[arg(long, default_value = "50000")]
+    seal_max_vectors: usize,
+
+    #[arg(long, default_value = "67108864")]
+    seal_max_bytes: usize,
+
+    #[arg(long, default_value = "30000")]
+    seal_max_age_ms: u64,
+
     #[arg(long, default_value = "1000")]
     cache_size: usize,
 
-    /// Embedding provider: ollama, openai, huggingface, cohere (disabled if not set)
     #[arg(long)]
     embedding_provider: Option<String>,
 
-    /// Embedding model name (e.g., nomic-embed-text, text-embedding-3-small)
     #[arg(long, default_value = "nomic-embed-text")]
     embedding_model: String,
 
-    /// Embedding API URL (e.g., http://localhost:11434 for Ollama)
     #[arg(long)]
     embedding_url: Option<String>,
 
-    /// Embedding API key (or use OPENAI_API_KEY / HF_API_KEY / COHERE_API_KEY env vars)
     #[arg(long)]
     embedding_api_key: Option<String>,
 
-    /// Admin API key (full read+write access). Can be specified multiple times.
-    /// Also reads from VECTRADB_API_KEY env var.
     #[arg(long)]
     api_key: Vec<String>,
 
-    /// Read-only API key (search, get, list only). Can be specified multiple times.
-    /// Also reads from VECTRADB_API_KEY_READONLY env var.
     #[arg(long)]
     api_key_readonly: Vec<String>,
 
-    /// TLS certificate file (PEM format). Enables HTTPS when set with --tls-key.
     #[arg(long)]
     tls_cert: Option<PathBuf>,
 
-    /// TLS private key file (PEM format). Enables HTTPS when set with --tls-cert.
     #[arg(long)]
     tls_key: Option<PathBuf>,
 
-    /// Rate limit: max requests per second per IP (0 = disabled)
     #[arg(long, default_value = "0")]
     rate_limit: f64,
 
-    /// Rate limit burst size: max concurrent requests before throttling
     #[arg(long, default_value = "100")]
     rate_burst: u32,
 }
 
+#[derive(Args, Debug)]
+struct MigrateArgs {
+    #[arg(long)]
+    from: PathBuf,
+
+    #[arg(long)]
+    to: PathBuf,
+
+    #[arg(short = 'd', long, default_value = "384")]
+    dimension: usize,
+
+    #[arg(short, long, default_value = "hnsw")]
+    algorithm: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse command line arguments
-    let args = Args::parse();
-
-    // Initialize logging
+    let cli = Cli::parse();
     env_logger::init();
 
-    // Parse search algorithm
-    let search_algorithm = match args.algorithm.to_lowercase().as_str() {
-        "hnsw" => SearchAlgorithm::HNSW,
-        "lsh" => SearchAlgorithm::LSH,
-        "pq" => SearchAlgorithm::PQ,
-        "es4d" => SearchAlgorithm::ES4D,
-        "sq" | "sq8" => SearchAlgorithm::SQ,
-        "ivf" => SearchAlgorithm::IVF,
-        _ => {
-            eprintln!(
-                "Invalid algorithm: {}. Supported: hnsw, lsh, pq, es4d, sq, ivf",
-                args.algorithm
-            );
-            std::process::exit(1);
-        }
+    match cli.command {
+        Some(Command::Migrate(args)) => run_migrate(args).await,
+        None => run_server(cli.serve).await,
+    }
+}
+
+async fn run_migrate(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let algorithm = parse_algorithm(&args.algorithm)?;
+    let config = DatabaseConfig {
+        data_dir: args.to.to_string_lossy().to_string(),
+        search_algorithm: algorithm,
+        index_config: vectradb_search::SearchConfig {
+            algorithm,
+            dimension: Some(args.dimension),
+            ..vectradb_search::SearchConfig::default()
+        },
+        ..DatabaseConfig::default()
     };
 
-    // Parse distance metric
-    let metric = match args.metric.to_lowercase().as_str() {
-        "euclidean" | "l2" => DistanceMetric::Euclidean,
-        "cosine" => DistanceMetric::Cosine,
-        "dot" | "dot_product" | "ip" => DistanceMetric::DotProduct,
-        _ => {
-            eprintln!(
-                "Invalid metric: {}. Supported: euclidean, cosine, dot",
-                args.metric
-            );
-            std::process::exit(1);
-        }
-    };
+    PersistentVectorDB::migrate_legacy_data(&args.from, &args.to, config).await?;
+    println!(
+        "Migrated legacy storage from {} to {}",
+        args.from.display(),
+        args.to.display()
+    );
+    Ok(())
+}
 
-    // Create database configuration
+async fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let search_algorithm = parse_algorithm(&args.algorithm)?;
+    let metric = parse_metric(&args.metric)?;
+
     let config = DatabaseConfig {
         data_dir: args.data_dir.to_string_lossy().to_string(),
         search_algorithm,
@@ -184,7 +197,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ivf_nlist: Some(args.ivf_nlist),
             ivf_nprobe: Some(args.ivf_nprobe),
         },
-        auto_flush: args.auto_flush,
+        durability_mode: parse_durability(&args.durability_mode)?,
+        commit_interval_ms: args.commit_interval_ms,
+        commit_max_vectors: args.commit_max_vectors,
+        commit_max_bytes: args.commit_max_bytes,
+        segment_max_vectors: args.seal_max_vectors,
+        segment_max_bytes: args.seal_max_bytes,
+        segment_max_age_secs: (args.seal_max_age_ms.saturating_add(999)) / 1000,
         cache_size: args.cache_size,
     };
 
@@ -192,17 +211,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Data directory: {}", config.data_dir);
     println!("Search algorithm: {:?}", config.search_algorithm);
     println!("Vector dimension: {}", args.dimension);
+    println!("Durability mode: {:?}", config.durability_mode);
     println!("HTTP port: {}", args.port);
     if args.enable_grpc {
         println!("gRPC port: {}", args.grpc_port);
     }
 
-    // Initialize database
-    let db = PersistentVectorDB::new(config.clone()).await?;
-    let db_arc = Arc::new(RwLock::new(db));
+    let db = Arc::new(PersistentVectorDB::new(config.clone()).await?);
 
-    // Initialize embedding provider (optional)
-    let embedder: Option<std::sync::Arc<dyn vectradb_embeddings::EmbeddingProvider>> =
+    let embedder: Option<Arc<dyn vectradb_embeddings::EmbeddingProvider>> =
         if let Some(provider_name) = &args.embedding_provider {
             let emb_config = vectradb_embeddings::EmbeddingConfig {
                 provider: provider_name.clone(),
@@ -211,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 api_key: args.embedding_api_key.clone(),
                 dimension: Some(args.dimension),
             };
+
             match vectradb_embeddings::create_provider(&emb_config) {
                 Ok(provider) => {
                     println!(
@@ -218,10 +236,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         provider.provider_name(),
                         provider.model_name()
                     );
-                    Some(std::sync::Arc::from(provider))
+                    Some(Arc::from(provider))
                 }
-                Err(e) => {
-                    eprintln!("Failed to initialize embedding provider: {e}");
+                Err(error) => {
+                    eprintln!("Failed to initialize embedding provider: {error}");
                     std::process::exit(1);
                 }
             }
@@ -229,7 +247,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         };
 
-    // Build auth config from CLI args + env vars
     let mut admin_keys = args.api_key;
     if let Ok(env_key) = std::env::var("VECTRADB_API_KEY") {
         admin_keys.push(env_key);
@@ -243,7 +260,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("API key authentication: enabled");
     }
 
-    // Initialize GPU engine (optional)
     #[cfg(feature = "gpu")]
     let gpu_engine: Option<Arc<vectradb_search::gpu::GpuDistanceEngine>> = {
         match vectradb_search::gpu::GpuDistanceEngine::new(100_000) {
@@ -258,7 +274,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // TLS configuration
     let tls_config = match (&args.tls_cert, &args.tls_key) {
         (Some(cert), Some(key)) => {
             println!(
@@ -278,7 +293,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Rate limiter
     let rate_config = vectradb_api::RateLimitConfig::new(args.rate_limit, args.rate_burst);
     if rate_config.enabled {
         println!(
@@ -290,8 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let rate_limiter = Arc::new(vectradb_api::RateLimiter::new(rate_config));
 
-    // Clone shared database for HTTP server
-    let http_db = db_arc.clone();
+    let http_db = db.clone();
     let http_embedder = embedder.clone();
     let http_auth = auth_config.clone();
     let http_rate_limiter = rate_limiter.clone();
@@ -300,11 +313,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_port = args.port;
     let http_tls = tls_config.clone();
 
-    // Prometheus metrics
     let metrics_handle = vectradb_api::metrics::install_prometheus_recorder();
     println!("Prometheus metrics: enabled at /metrics");
 
-    // Graceful shutdown signal (SIGINT / SIGTERM)
     let shutdown = async {
         let ctrl_c = tokio::signal::ctrl_c();
 
@@ -327,15 +338,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nShutdown signal received. Draining in-flight requests...");
     };
 
-    // Share the shutdown signal across servers via a notify
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let http_shutdown = shutdown_notify.clone();
     let grpc_shutdown = shutdown_notify.clone();
 
-    // Flush database reference (for shutdown cleanup)
-    let flush_db = db_arc.clone();
-
-    // Start HTTP server task
     let http_handle = tokio::spawn(async move {
         let state = vectradb_api::AppState {
             db: http_db,
@@ -350,70 +356,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             graph_agent: None,
         };
         let app = vectradb_api::create_router(state);
-        let addr = format!("0.0.0.0:{}", http_port);
+        let addr = format!("0.0.0.0:{http_port}");
 
         if let Some((cert_path, key_path)) = http_tls {
-            // HTTPS with TLS
             let tls =
                 match axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
                     .await
                 {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Failed to load TLS cert/key: {e}");
+                    Ok(config) => config,
+                    Err(error) => {
+                        eprintln!("Failed to load TLS cert/key: {error}");
                         return;
                     }
                 };
+
             println!("VectraDB HTTPS server running on https://{addr}");
-            if let Err(e) = axum_server::bind_rustls(addr.parse().unwrap(), tls)
+            if let Err(error) = axum_server::bind_rustls(addr.parse().unwrap(), tls)
                 .serve(app.into_make_service())
                 .await
             {
-                eprintln!("HTTPS server error: {e}");
+                eprintln!("HTTPS server error: {error}");
             }
         } else {
-            // Plain HTTP with graceful shutdown
             let listener = match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("Failed to bind HTTP port {http_port}: {e}");
+                Ok(listener) => listener,
+                Err(error) => {
+                    eprintln!("Failed to bind HTTP port {http_port}: {error}");
                     return;
                 }
             };
+
             println!("VectraDB HTTP server running on http://{addr}");
-            if let Err(e) = axum::serve(listener, app)
+            if let Err(error) = axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     http_shutdown.notified().await;
                 })
                 .await
             {
-                eprintln!("HTTP server error: {e}");
+                eprintln!("HTTP server error: {error}");
             }
         }
     });
 
-    // Start gRPC server if enabled
     if args.enable_grpc {
         let grpc_addr = format!("0.0.0.0:{}", args.grpc_port).parse()?;
-        let grpc_service = VectraDbService::new(db_arc).into_service();
+        let grpc_service = VectraDbService::new(db.clone()).into_service();
 
         let grpc_handle = tokio::spawn(async move {
             let mut builder = Server::builder();
 
-            // Enable gRPC-TLS if cert/key provided
             if let Some((cert_path, key_path)) = tls_config {
-                let cert_pem = std::fs::read_to_string(&cert_path).unwrap_or_else(|e| {
-                    eprintln!("Failed to read TLS cert for gRPC: {e}");
+                let cert_pem = std::fs::read_to_string(&cert_path).unwrap_or_else(|error| {
+                    eprintln!("Failed to read TLS cert for gRPC: {error}");
                     std::process::exit(1);
                 });
-                let key_pem = std::fs::read_to_string(&key_path).unwrap_or_else(|e| {
-                    eprintln!("Failed to read TLS key for gRPC: {e}");
+                let key_pem = std::fs::read_to_string(&key_path).unwrap_or_else(|error| {
+                    eprintln!("Failed to read TLS key for gRPC: {error}");
                     std::process::exit(1);
                 });
                 let tls = tonic::transport::ServerTlsConfig::new()
                     .identity(tonic::transport::Identity::from_pem(cert_pem, key_pem));
-                builder = builder.tls_config(tls).unwrap_or_else(|e| {
-                    eprintln!("Failed to configure gRPC TLS: {e}");
+                builder = builder.tls_config(tls).unwrap_or_else(|error| {
+                    eprintln!("Failed to configure gRPC TLS: {error}");
                     std::process::exit(1);
                 });
                 println!("VectraDB gRPC-TLS server running on {grpc_addr}");
@@ -421,38 +425,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("VectraDB gRPC server running on {grpc_addr}");
             }
 
-            // gRPC with graceful shutdown
-            if let Err(e) = builder
+            if let Err(error) = builder
                 .add_service(grpc_service)
                 .serve_with_shutdown(grpc_addr, async move {
                     grpc_shutdown.notified().await;
                 })
                 .await
             {
-                eprintln!("gRPC server error: {e}");
+                eprintln!("gRPC server error: {error}");
             }
         });
 
-        // Wait for shutdown signal, then notify both servers
         shutdown.await;
         shutdown_notify.notify_waiters();
-
-        // Wait for both servers to drain
         let _ = tokio::join!(http_handle, grpc_handle);
     } else {
-        // Only HTTP server — wait for shutdown
         shutdown.await;
         shutdown_notify.notify_waiters();
         let _ = http_handle.await;
     }
 
-    // Final flush to ensure all data is persisted
-    println!("Flushing database to disk...");
-    let db = flush_db.read().await;
-    if let Err(e) = db.flush() {
-        eprintln!("Warning: failed to flush database: {e}");
-    }
     println!("VectraDB shutdown complete.");
-
     Ok(())
+}
+
+fn parse_algorithm(value: &str) -> Result<SearchAlgorithm, Box<dyn std::error::Error>> {
+    match value.to_lowercase().as_str() {
+        "hnsw" => Ok(SearchAlgorithm::HNSW),
+        _ => Err(format!(
+            "Invalid algorithm: {value}. The v2 storage engine currently supports only hnsw."
+        )
+        .into()),
+    }
+}
+
+fn parse_metric(value: &str) -> Result<DistanceMetric, Box<dyn std::error::Error>> {
+    match value.to_lowercase().as_str() {
+        "euclidean" | "l2" => Ok(DistanceMetric::Euclidean),
+        "cosine" => Ok(DistanceMetric::Cosine),
+        "dot" | "dot_product" | "ip" => Ok(DistanceMetric::DotProduct),
+        _ => Err(
+            format!("Invalid metric: {value}. Supported metrics: euclidean, cosine, dot").into(),
+        ),
+    }
+}
+
+fn parse_durability(value: &str) -> Result<DurabilityMode, Box<dyn std::error::Error>> {
+    match value.to_lowercase().as_str() {
+        "batch" => Ok(DurabilityMode::Batch),
+        "async" => Ok(DurabilityMode::Async),
+        "strict" => Ok(DurabilityMode::Strict),
+        _ => Err(format!(
+            "Invalid durability mode: {value}. Supported modes: batch, async, strict"
+        )
+        .into()),
+    }
 }

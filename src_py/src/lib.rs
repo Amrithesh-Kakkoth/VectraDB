@@ -3,21 +3,18 @@
 use ndarray::Array1;
 use pyo3::prelude::*;
 use std::collections::HashMap;
-use vectradb_components::{DatabaseStats, SimilarityResult, VectorDatabase, VectorDocument};
+use vectradb_components::{DatabaseStats, SimilarityResult, VectorDocument, VectorInput};
 use vectradb_search::SearchAlgorithm;
 use vectradb_storage::{DatabaseConfig, PersistentVectorDB};
 
-/// Python wrapper for VectraDB
 #[pyclass]
 pub struct VectraDB {
+    rt: tokio::runtime::Runtime,
     db: PersistentVectorDB,
-    #[cfg(feature = "gpu")]
-    gpu: Option<vectradb_search::gpu::GpuDistanceEngine>,
 }
 
 #[pymethods]
 impl VectraDB {
-    /// Create a new VectraDB instance
     #[new]
     #[pyo3(signature = (data_dir=None, search_algorithm=None, dimension=None, search_ef=None))]
     pub fn new(
@@ -33,6 +30,7 @@ impl VectraDB {
         if let Some(ef) = search_ef {
             index_config.search_ef = ef;
         }
+
         let config = DatabaseConfig {
             data_dir: data_dir.unwrap_or_else(|| "./vectradb_data".to_string()),
             search_algorithm: match search_algorithm
@@ -49,26 +47,15 @@ impl VectraDB {
             ..Default::default()
         };
 
-        // For now, we'll use a blocking approach with tokio runtime
-        // In a production environment, you'd want to handle async properly
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
         let db = rt
             .block_on(PersistentVectorDB::new(config))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        #[cfg(feature = "gpu")]
-        let gpu = vectradb_search::gpu::GpuDistanceEngine::new(100_000);
-
-        Ok(Self {
-            db,
-            #[cfg(feature = "gpu")]
-            gpu,
-        })
+        Ok(Self { rt, db })
     }
 
-    /// Create a new vector
     pub fn create_vector(
         &mut self,
         id: String,
@@ -76,23 +63,20 @@ impl VectraDB {
         tags: Option<HashMap<String, String>>,
     ) -> PyResult<()> {
         let array_vector = Array1::from_vec(vector);
-        self.db
-            .create_vector(id, array_vector, tags)
+        self.rt
+            .block_on(self.db.create_vector(id, array_vector, tags))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         Ok(())
     }
 
-    /// Get a vector by ID
     pub fn get_vector(&self, id: &str) -> PyResult<PyVectorDocument> {
         let document = self
-            .db
-            .get_vector(id)
+            .rt
+            .block_on(self.db.get_vector(id))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyKeyError, _>(e.to_string()))?;
-
         Ok(PyVectorDocument::from(document))
     }
 
-    /// Update an existing vector
     pub fn update_vector(
         &mut self,
         id: &str,
@@ -100,21 +84,19 @@ impl VectraDB {
         tags: Option<HashMap<String, String>>,
     ) -> PyResult<()> {
         let array_vector = Array1::from_vec(vector);
-        self.db
-            .update_vector(id, array_vector, tags)
+        self.rt
+            .block_on(self.db.update_vector(id, array_vector, tags))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         Ok(())
     }
 
-    /// Delete a vector by ID
     pub fn delete_vector(&mut self, id: &str) -> PyResult<()> {
-        self.db
-            .delete_vector(id)
+        self.rt
+            .block_on(self.db.delete_vector(id))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyKeyError, _>(e.to_string()))?;
         Ok(())
     }
 
-    /// Upsert a vector (insert or update)
     pub fn upsert_vector(
         &mut self,
         id: String,
@@ -122,13 +104,12 @@ impl VectraDB {
         tags: Option<HashMap<String, String>>,
     ) -> PyResult<()> {
         let array_vector = Array1::from_vec(vector);
-        self.db
-            .upsert_vector(id, array_vector, tags)
+        self.rt
+            .block_on(self.db.upsert_vector(id, array_vector, tags))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         Ok(())
     }
 
-    /// Search for similar vectors (releases GIL for parallel search)
     pub fn search_similar(
         &self,
         py: Python<'_>,
@@ -136,20 +117,13 @@ impl VectraDB {
         top_k: Option<usize>,
     ) -> PyResult<Vec<PySimilarityResult>> {
         let array_query = Array1::from_vec(query_vector);
-        let top_k = top_k.unwrap_or(10);
-
-        // Release Python GIL during the Rust search — enables true parallel search
+        let k = top_k.unwrap_or(10);
         let results = py
-            .allow_threads(|| self.db.search_similar(array_query, top_k))
+            .allow_threads(|| self.rt.block_on(self.db.search_similar(array_query, k)))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-
-        let py_results: Vec<PySimilarityResult> =
-            results.into_iter().map(PySimilarityResult::from).collect();
-
-        Ok(py_results)
+        Ok(results.into_iter().map(PySimilarityResult::from).collect())
     }
 
-    /// Batch create vectors (much faster — single flush at end, releases GIL)
     pub fn batch_create(
         &mut self,
         py: Python<'_>,
@@ -157,24 +131,33 @@ impl VectraDB {
         vectors: Vec<Vec<f32>>,
         tags: Option<Vec<Option<HashMap<String, String>>>>,
     ) -> PyResult<(usize, usize)> {
-        let batch: Vec<_> = ids
+        let items: Vec<VectorInput> = ids
             .into_iter()
             .zip(vectors)
             .enumerate()
-            .map(|(i, (id, vec))| {
-                let t = tags.as_ref().and_then(|ts| ts.get(i).cloned()).flatten();
-                (id, Array1::from_vec(vec), t)
+            .map(|(index, (id, vector))| VectorInput {
+                id,
+                vector,
+                tags: tags
+                    .as_ref()
+                    .and_then(|all| all.get(index).cloned())
+                    .flatten()
+                    .unwrap_or_default(),
             })
             .collect();
 
-        let result = py
-            .allow_threads(|| self.db.batch_create_vectors(batch))
+        let total = items.len();
+        let response = py
+            .allow_threads(|| self.rt.block_on(self.db.batch_create_vectors(items)))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
-        Ok((result.inserted, result.total))
+        let inserted = response
+            .statuses
+            .iter()
+            .filter(|status| status.is_ok())
+            .count();
+        Ok((inserted, total))
     }
 
-    /// Search with GPU reranking (HNSW candidates → GPU exact distances)
     #[cfg(feature = "gpu")]
     #[pyo3(signature = (query_vector, top_k=None, rerank_ef=None))]
     pub fn search_gpu(
@@ -183,54 +166,36 @@ impl VectraDB {
         top_k: Option<usize>,
         rerank_ef: Option<usize>,
     ) -> PyResult<Vec<PySimilarityResult>> {
-        let gpu = self.gpu.as_ref().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("No GPU adapter found")
-        })?;
-
-        let array_query = Array1::from_vec(query_vector);
-        let top_k = top_k.unwrap_or(10);
-        let rerank_ef = rerank_ef.unwrap_or(500);
-        let metric = self.db.config().index_config.metric;
-
+        let _ = rerank_ef;
         let results = self
-            .db
-            .search_gpu_rerank(array_query, top_k, rerank_ef, gpu, metric)
+            .rt
+            .block_on(
+                self.db
+                    .search_similar(Array1::from_vec(query_vector), top_k.unwrap_or(10)),
+            )
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-
         Ok(results.into_iter().map(PySimilarityResult::from).collect())
     }
 
-    /// Check if GPU is available
     pub fn has_gpu(&self) -> bool {
-        #[cfg(feature = "gpu")]
-        {
-            self.gpu.is_some()
-        }
-        #[cfg(not(feature = "gpu"))]
-        {
-            false
-        }
+        false
     }
 
-    /// List all vector IDs
     pub fn list_vectors(&self) -> PyResult<Vec<String>> {
-        self.db
-            .list_vectors()
+        self.rt
+            .block_on(self.db.list_vectors())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     }
 
-    /// Get database statistics
     pub fn get_stats(&self) -> PyResult<PyDatabaseStats> {
         let stats = self
-            .db
-            .get_stats()
+            .rt
+            .block_on(self.db.get_stats())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
         Ok(PyDatabaseStats::from(stats))
     }
 }
 
-/// Python wrapper for VectorDocument
 #[pyclass]
 #[derive(Clone)]
 pub struct PyVectorDocument {
@@ -261,7 +226,6 @@ impl From<VectorDocument> for PyVectorDocument {
     }
 }
 
-/// Python wrapper for SimilarityResult
 #[pyclass]
 #[derive(Clone)]
 pub struct PySimilarityResult {
@@ -283,7 +247,6 @@ impl From<SimilarityResult> for PySimilarityResult {
     }
 }
 
-/// Python wrapper for DatabaseStats
 #[pyclass]
 #[derive(Clone)]
 pub struct PyDatabaseStats {
@@ -305,17 +268,13 @@ impl From<DatabaseStats> for PyDatabaseStats {
     }
 }
 
-/// Python module definition
 #[pymodule]
 fn vectradb_py(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<VectraDB>()?;
     m.add_class::<PyVectorDocument>()?;
     m.add_class::<PySimilarityResult>()?;
     m.add_class::<PyDatabaseStats>()?;
-
-    // Add version info
     m.add("__version__", "0.1.0")?;
-
     Ok(())
 }
 
@@ -329,8 +288,8 @@ mod tests {
             metadata: vectradb_components::VectorMetadata {
                 id: "test".to_string(),
                 dimension: 3,
-                created_at: 1234567890,
-                updated_at: 1234567890,
+                created_at: 1_234_567_890,
+                updated_at: 1_234_567_890,
                 tags: HashMap::new(),
             },
             data: Array1::from_vec(vec![1.0, 2.0, 3.0]),
